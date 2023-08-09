@@ -13,6 +13,12 @@ matplotlib = "*"
 seaborn = "*"
 yellowbrick = "*"
 requests = "*"
+fsspec = "*"
+kneed = "*"
+fastapi = "*"
+joblib = "*"
+pyyaml = "*"
+setuptools = "*"
 
 [dev-packages]
 ipykernel = "*"
