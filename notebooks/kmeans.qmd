@@ -1,0 +1,577 @@
+---
+title: "GP Practices Clustering Model"
+format: html
+---
+
+```{python}
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+import seaborn as sns
+
+from kneed import KneeLocator
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler
+
+```
+
+```{python}
+
+colours = ['#005EB8', '#00978D', '#1C355E', '#768692']
+
+# set plot theme
+sns.set_theme(
+    style='ticks',
+    palette=colours,
+    font_scale=1.25,
+    rc={'figure.figsize':(12,8),
+        'axes.titlesize':20,
+        'axes.spines.top':False,
+        'axes.spines.right':False}
+)
+```
+
+```{python}
+
+data_dir = '../data/'
+
+practices_raw = (
+    pl.scan_ipc(data_dir + 'practices.arrow')
+    # fill nulls for staff columns with 0
+    .with_columns(pl.col('^.*_(fte|hc)$').fill_null(0))
+    # drop nulls for other columns
+    .drop_nulls()
+    .filter(
+        (pl.col('total_patients') != 0) &
+        (pl.all_horizontal(pl.col('^.*_(fte|hc)$') != 0))
+        )
+    .collect()
+)
+
+```
+
+## Feature Engineering
+
+```{python}
+
+def scale_rural_urban_classes(practices_raw):
+    df = practices_raw.with_columns(
+        # pl.when(pl.col('ruc_code') == "A1").then(pl.lit(1))
+        # .when(pl.col('ruc_code') == "B1").then(pl.lit(2))
+        # .when(pl.col('ruc_code') == "C1").then(pl.lit(3))
+        # .when(pl.col('ruc_code') == "C2").then(pl.lit(4))
+        # .when(pl.col('ruc_code') == "D1").then(pl.lit(5))
+        # .when(pl.col('ruc_code') == "D2").then(pl.lit(6))
+        # .when(pl.col('ruc_code') == "E1").then(pl.lit(7))
+        # .when(pl.col('ruc_code') == "E2").then(pl.lit(8))
+        pl.when(pl.col('ruc2') == "Urban").then(pl.lit(1))
+        .when(pl.col('ruc2') == "Rural").then(pl.lit(2))
+        .alias('ruc')
+    )
+
+    return df
+
+def sum_staff_totals(practices_raw):
+    df = practices_raw.with_columns(
+        pl.sum_horizontal(pl.col('^.*_(fte|hc)$')).alias('total_staff'),
+        pl.sum_horizontal(pl.col('^(total_gp)_.*$')).alias('total_gps'),
+        pl.sum_horizontal(pl.col('^(total_nurses)_.*$')).alias('total_nurses'),
+        pl.sum_horizontal(pl.col('^(total_admin)_.*$')).alias('total_admins')
+    )
+
+    return df
+
+def calculate_patients_per_staff(practices_raw):
+    df = practices_raw.with_columns(
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^.*_(fte|hc)$')))
+        .alias('pts_per_staff'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_gp)_.*$')))
+        .alias('pts_per_gp'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_nurses)_.*$')))
+        .alias('pts_per_nurse'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_admin)_.*$')))
+        .alias('pts_per_admin'),
+    )
+
+    return df
+
+def calculate_patient_proportions(practices_raw):
+    df = practices_raw.with_columns(
+        (pl.col('total_male') / pl.col('total_patients')).alias('prop_male'),
+        (pl.col('total_female') / pl.col('total_patients')).alias('prop_female'),
+        (pl.sum_horizontal(pl.col('^.*_(0to4|5to14)$'))  / pl.col('total_patients'))
+        .alias('prop_0to14'),
+        (pl.sum_horizontal(pl.col('^.*_(15to44|45to64)$'))  / pl.col('total_patients'))
+        .alias('prop_15to64'),
+        (pl.sum_horizontal(pl.col('^.*_(65to74|75to84|85plus)$')) / pl.col('total_patients'))
+        .alias('prop_65plus')
+    )
+
+    return df
+
+def approximate_patient_summary_stats(practices_raw):
+    df = practices_raw.with_columns(
+        ((pl.sum_horizontal((pl.col('^.*_(0to4)$')) * 2) +
+        (pl.sum_horizontal(pl.col('^.*_(5to14)$')) * 9) +
+        (pl.sum_horizontal(pl.col('^.*_(15to44)$')) * 30) +
+        (pl.sum_horizontal(pl.col('^.*_(45to64)$')) * 55) +
+        (pl.sum_horizontal(pl.col('^.*_(65to74)$')) * 70) +
+        (pl.sum_horizontal(pl.col('^.*_(75to84)$')) * 80) +
+        (pl.sum_horizontal(pl.col('^.*_(85plus)$')) * 90)) /
+        pl.col('total_patients'))
+        .alias('approx_mean_age')
+    )
+
+    return df
+
+```
+
+```{python}
+
+df = (
+    practices_raw.lazy()
+    .pipe(scale_rural_urban_classes)
+    .pipe(sum_staff_totals)
+    .pipe(calculate_patients_per_staff)
+    .pipe(calculate_patient_proportions)
+    .pipe(approximate_patient_summary_stats)
+    .collect()
+)
+
+```
+
+```{python}
+
+df.filter(pl.col('total_staff') == 0)
+
+```
+
+## Feature Selection & Preprocessing
+
+```{python}
+
+feats = [
+    'imd_quartile',
+    'ruc',
+    'total_patients',
+    #'total_staff',
+    'total_gps',
+    'total_nurses',
+    # 'prop_male',
+    'prop_female',
+    # 'prop_0to14',
+    'prop_15to64',
+    # 'prop_65plus',
+    'approx_mean_age',
+    'pts_per_gp',
+    'pts_per_nurse',
+    'pts_per_admin',
+    # 'pts_per_staff'
+]
+
+scaler = MinMaxScaler()
+pca = PCA(n_components=2)
+
+preprocessing_pipeline = Pipeline(
+    [
+        ('minmaxscaler', scaler),
+        ("pca", pca)
+    ]
+)
+
+```
+
+## Identify K Clusters
+
+```{python}
+
+kmeans_kwargs = {
+   "init": "k-means++",
+   "n_init": 100,
+   "max_iter": 1000
+}
+
+sse = []
+for k in range(1, 11):
+    kmeans = KMeans(n_clusters=k, **kmeans_kwargs)
+    kmeans.fit(df[feats])
+    sse.append(kmeans.inertia_)
+
+sns.lineplot(x = range(1, 11), y = sse)
+
+plt.xticks(range(1, 11))
+
+plt.xlabel("Clusters")
+plt.ylabel("SSE")
+plt.show()
+
+```
+
+Visually inspecting the plot makes it a little difficult to identify the elbow point, but it looks like 3 or even 4 clusters would be defensible. We can also use the kneedle algorithm to identify the elbow point programmatically.
+
+```{python}
+
+kneedle = KneeLocator(range(1, 11), sse, curve="convex", direction="decreasing")
+
+kneedle.elbow
+
+# kneedle.plot_knee_normalized()
+
+```
+
+The kneedle algorithm suggests 3 clusters, which is consistent with the plot. We can also use the silhouette coefficient to identify the optimal number of clusters.
+
+```{python}
+
+silhouette_scores = []
+
+for k in range(2, 11):
+    kmeans = KMeans(n_clusters=k, **kmeans_kwargs)
+    kmeans.fit(df[feats])
+    score = silhouette_score(X, kmeans.labels_)
+    silhouette_scores.append(score)
+
+sns.lineplot(x = range(2, 11), y = silhouette_scores)
+
+plt.xticks(range(2, 11))
+
+plt.xlabel("Clusters")
+plt.ylabel("Silhouette Coefficient")
+plt.show()
+
+```
+
+There's quite a sharp decline in the silhouette coefficient as we increase the number of clusters, but it looks like 3 clusters would be defensible (a drop from .6 to ~.525).
+
+## Tune Principal Components
+
+```{python}
+
+silhouette_scores = []
+
+for n in range(2, 11):
+    km_pipeline["preprocess"]["pca"].n_components = n
+    km_pipeline.fit(df[feats])
+    silhouette_coef = silhouette_score(
+        km_pipeline["preprocess"].transform(df[feats]),
+        km_pipeline["kmeans"].labels_,
+    )
+
+    silhouette_scores.append(silhouette_coef)
+
+sns.lineplot(x = range(2, 11), y = silhouette_scores)
+
+plt.xlabel("Principal Components")
+plt.ylabel("Silhouette Coefficient")
+plt.title("Clustering Performance as a Function of PCA Components")
+plt.tight_layout()
+
+plt.show()
+
+```
+
+## K-Means Clustering
+
+```{python}
+
+km = KMeans(
+    n_clusters=3,
+    init='k-means++',
+    n_init=100,
+    max_iter=1000,
+    tol=0.0001,
+    verbose=0,
+    copy_x=True
+    )
+
+km_pipeline = Pipeline(
+    [
+        ('preprocess', preprocessing_pipeline),
+        ('kmeans', km)
+    ]
+)
+
+km_pipeline.fit(df[feats])
+# pipe.transform(test_df)
+
+```
+
+```{python}
+
+km_pipeline.named_steps['kmeans'].cluster_centers_
+
+km_pipeline.named_steps['kmeans'].labels_
+
+km_pipeline.named_steps['kmeans'].inertia_
+
+km_pipeline.named_steps['kmeans'].n_iter_
+
+km_pipe.named_steps['kmeans'].get_params()
+
+```
+
+### Evaluate Model Performance
+
+```{python}
+
+km_labels = km_pipeline.named_steps['kmeans'].labels_
+
+# Number of clusters in labels, ignoring noise if present.
+n_clusters_ = len(set(km_labels)) - (1 if -1 in km_labels else 0)
+n_noise_ = list(km_labels).count(-1)
+
+print("Estimated number of clusters: %d" % n_clusters_)
+print("Estimated number of noise points: %d" % n_noise_)
+
+```
+
+```{python}
+
+km_data = km_pipeline["preprocess"].transform(df[feats])
+
+km_labels = km_pipeline["kmeans"].labels_
+
+km_score = silhouette_score(km_data, km_labels)
+
+```
+
+A silhouette coefficient of ~.67 is pretty good.
+
+### Visualise K-Means Clusters
+
+We can also visualise the clusters against our data to see if they make intuitive sense, and to identify any outliers that might have been misclassified.
+
+```{python}
+
+kmeans_df = df.with_columns(
+        kmeans_clusters = pl.lit(
+            km_pipeline.named_steps['kmeans'].labels_
+            )
+    )
+```
+
+```{python}
+
+# visualise clusters
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.histplot(
+    x= 'approx_mean_age',
+    data=kmeans_df.to_pandas(),
+    hue='kmeans_clusters',
+    palette=colours[0:3],
+    ax=ax
+)
+
+plt.xlabel('Age')
+plt.ylabel('')
+plt.title('Approx. Mean Age Split by Cluster')
+
+plt.show()
+
+```
+
+
+```{python}
+
+# visualise clusters
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.countplot(
+    x= 'imd_quartile',
+    data=kmeans_df.to_pandas(),
+    hue='kmeans_clusters',
+    palette=colours[0:3],
+    alpha=0.6,
+    ax=ax
+)
+
+plt.xlabel('IMD Quartile')
+plt.ylabel('')
+plt.title('IMD Quartile by Cluster')
+
+plt.show()
+
+```
+
+```{python}
+
+# visualise clusters
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.countplot(
+    x= 'ruc',
+    data=kmeans_df.to_pandas(),
+    hue='kmeans_clusters',
+    palette=colours[0:3],
+    alpha=0.6,
+    ax=ax
+)
+
+plt.xlabel('RUC')
+plt.ylabel('')
+plt.title('Rural-Urban Classification Split by Cluster')
+
+plt.show()
+
+```
+
+
+```{python}
+#| label: imd-clusters
+
+def jitter(values, j):
+    return values + np.random.normal(0, j, values.shape)
+
+# visualise clusters
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.scatterplot(
+    x= jitter(X['imd_quartile'], .1),
+    y= 'approx_mean_age',
+    data=kmeans_df.to_pandas(),
+    hue='kmeans_clusters',
+    palette=colours[0:3],
+    s=100,
+    alpha=0.6,
+    ax=ax
+)
+
+plt.xticks(range(1, 6, 1))
+
+plt.xlabel('IMD Quartile')
+plt.ylabel('Approx. Mean Age')
+plt.title('GP Practice Clusters by IMD Quartile and Approx. Mean Age')
+
+plt.show()
+
+```
+
+```{python}
+#| label: ruc-clusters
+
+# visualise clusters
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.scatterplot(
+    x= jitter(X['ruc'], .05),
+    y= 'approx_mean_age',
+    data=kmeans_df.to_pandas(),
+    hue='kmeans_clusters',
+    palette=colours[0:3],
+    s=100,
+    alpha=0.6,
+    ax=ax
+)
+
+plt.xticks(range(1, 3, 1))
+
+plt.xlabel('Rural-Urban Classification')
+plt.ylabel('Approx. Mean Age')
+plt.title('GP Practice Clusters by RUC and Approx. Mean Age')
+
+plt.show()
+
+```
+
+## DBSCAN Clustering
+
+It's worth testing a couple other approaches to clustering, to see if they perform better than K-Means. We'll start with DBSCAN.
+
+```{python}
+
+dbscan = DBSCAN(
+    eps=0.15,
+    min_samples=1000,
+    metric='cosine',
+    metric_params=None,
+    algorithm='auto',
+    leaf_size=30,
+    p=None,
+    n_jobs=None
+)
+
+db_pipeline = Pipeline(
+    [
+        ('preprocess', preprocessing_pipeline),
+        ('dbscan', dbscan)
+    ]
+)
+
+db_pipeline.fit(df[feats])
+
+```
+
+```{python}
+
+db_pipeline.named_steps['dbscan'].labels_
+
+db_pipeline.named_steps['dbscan'].get_params()
+
+```
+
+```{python}
+
+db_labels = db_pipeline.named_steps['dbscan'].labels_
+
+# Number of clusters in labels, ignoring noise if present.
+n_clusters_ = len(set(db_labels)) - (1 if -1 in db_labels else 0)
+n_noise_ = list(db_labels).count(-1)
+
+print("Estimated number of clusters: %d" % n_clusters_)
+print("Estimated number of noise points: %d" % n_noise_)
+
+```
+
+```{python}
+
+dbscan_df = df.with_columns(
+        dbscan_clusters = pl.lit(db_pipeline.named_steps['dbscan'].labels_)
+    )
+
+```
+
+```{python}
+
+# visualise clusters
+
+fig, ax = plt.subplots(figsize=(12,8))
+
+sns.scatterplot(
+    x= jitter(dbscan_df['imd_quartile'], .1),
+    y= 'approx_mean_age',
+    data=dbscan_df.to_pandas(),
+    hue='dbscan_clusters',
+    palette=colours[0:3],
+    s=100,
+    alpha=.6,
+    ax=ax
+)
+
+plt.xticks(range(1, 6, 1))
+
+plt.xlabel('IMD Quartile')
+plt.ylabel('Approx. Mean Age')
+plt.title('GP Practice Clusters by IMD Quartile and Approx. Mean Age')
+
+plt.show()
+
+```
+
+```{python}
+
+db_data = db_pipeline["preprocess"].transform(df[feats])
+db_labels = db_pipeline["dbscan"].labels_
+
+db_score = silhouette_score(db_data, db_labels)
+
+print(f'DBSCAN vs K-Means Difference: {db_score - km_score}')
+
+```
+
+So the DBSCAN model performs slightly worse than K-Means, but not by much.
+

@@ -1,0 +1,441 @@
+---
+title: "GP Practices EDA"
+format: html
+---
+
+```{python}
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+import seaborn as sns
+
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+```
+
+```{python}
+
+colours = ['#005EB8', '#00978D', '#1C355E', '#768692']
+
+# set plot theme
+sns.set_theme(
+    style='ticks',
+    palette=colours,
+    font_scale=1.25,
+    rc={'figure.figsize':(12,8),
+        'axes.titlesize':20,
+        'axes.spines.top':False,
+        'axes.spines.right':False}
+)
+```
+
+```{python}
+
+data_dir = '../data/'
+
+practices_raw = (
+    pl.scan_ipc(data_dir + 'practices.arrow')
+    # fill nulls for staff columns with 0
+    .with_columns(pl.col('^.*_(fte|hc)$').fill_null(0))
+    # drop nulls for other columns
+    .drop_nulls()
+    .filter(
+        (pl.col('total_patients') != 0) &
+        (pl.all_horizontal(pl.col('^.*_(fte|hc)$') != 0))
+        )
+    .collect()
+)
+
+```
+
+## Data Overview
+
+```{python}
+
+practices_raw.head()
+
+practices_raw.describe()
+
+```
+
+## Distributions
+
+```{python}
+
+# select numeric columns
+numeric_cols = (
+    practices_raw
+    .drop(['imd_decile', 'imd_quartile'])
+    .select([pl.col(pl.NUMERIC_DTYPES)])
+    .columns
+)
+
+# specify columns and rows
+ncols = 3
+nrows = int(len(numeric_cols)/ncols)
+
+# create figure and axes
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols*8,nrows*4))
+
+for i, col in enumerate(numeric_cols):
+    ax = axes[i//ncols, i%ncols]
+    sns.histplot(x=practices_raw[col], ax=ax)
+    ax.set_ylabel('')
+    ax.set_xlabel(col, fontsize=20)
+
+plt.suptitle('Numerical Feature Distributions', fontsize=30, y=1)
+plt.tight_layout()
+plt.show()
+
+```
+
+```{python}
+
+fig, ax = plt.subplots(figsize=(12,8))
+sns.barplot(
+    data = (practices_raw
+                .select(['oa_class'])
+                .groupby('oa_class')
+                .agg(pl.count())
+                .sort('count', descending=True)
+                .filter(pl.col('count') > 100)
+            ).to_pandas(),
+     y = 'oa_class', x = 'count', color = colours[0])
+
+ax.set(xlabel="", ylabel="")
+plt.title('Distribution of OA Class')
+
+```
+
+```{python}
+
+fig, ax = plt.subplots(figsize=(12,8))
+sns.barplot(
+    data = (practices_raw
+                .select(['soa_class'])
+                .groupby('soa_class')
+                .agg(pl.count())
+                .sort('count', descending=True)
+            ).to_pandas(),
+     y = 'soa_class', x = 'count', color = colours[0])
+
+ax.set(xlabel="", ylabel="")
+plt.title('Distribution of SOA Class')
+
+```
+
+```{python}
+
+fig, ax = plt.subplots(figsize=(12,8))
+sns.barplot(
+    data = (practices_raw
+                .select(['ruc10'])
+                .groupby('ruc10')
+                .agg(pl.count())
+                .sort('count', descending=True)
+            ).to_pandas(),
+     y = 'ruc10', x = 'count', color = colours[0])
+
+ax.set(xlabel="", ylabel="")
+plt.title('Distribution of Rural-Urban Classification (10)')
+
+```
+
+```{python}
+
+fig, ax = plt.subplots(figsize=(12,8))
+sns.countplot(data = practices_raw.to_pandas(), x = "ruc2")
+
+ax.set(xlabel="", ylabel="")
+plt.title('Distribution of Rural-Urban Classification (2)')
+
+```
+
+```{python}
+
+sns.histplot(data = practices_raw, x = 'imd_2019', bins = 10)
+
+plt.title('Distribution of IMD Score')
+
+```
+
+## Feature Engineering
+
+```{python}
+
+def scale_rural_urban_classes(practices_raw):
+    df = practices_raw.with_columns(
+        # pl.when(pl.col('ruc_code') == "A1").then(pl.lit(1))
+        # .when(pl.col('ruc_code') == "B1").then(pl.lit(2))
+        # .when(pl.col('ruc_code') == "C1").then(pl.lit(3))
+        # .when(pl.col('ruc_code') == "C2").then(pl.lit(4))
+        # .when(pl.col('ruc_code') == "D1").then(pl.lit(5))
+        # .when(pl.col('ruc_code') == "D2").then(pl.lit(6))
+        # .when(pl.col('ruc_code') == "E1").then(pl.lit(7))
+        # .when(pl.col('ruc_code') == "E2").then(pl.lit(8))
+        pl.when(pl.col('ruc2') == "Urban").then(pl.lit(1))
+        .when(pl.col('ruc2') == "Rural").then(pl.lit(2))
+        .alias('ruc')
+    )
+
+    return df
+
+def sum_staff_totals(practices_raw):
+    df = practices_raw.with_columns(
+        pl.sum_horizontal(pl.col('^.*_(fte|hc)$')).alias('total_staff'),
+        pl.sum_horizontal(pl.col('^(total_gp)_.*$')).alias('total_gps'),
+        pl.sum_horizontal(pl.col('^(total_nurses)_.*$')).alias('total_nurses'),
+        pl.sum_horizontal(pl.col('^(total_admin)_.*$')).alias('total_admins')
+    )
+
+    return df
+
+def calculate_patients_per_staff(practices_raw):
+    df = practices_raw.with_columns(
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^.*_(fte|hc)$')))
+        .alias('pts_per_staff'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_gp)_.*$')))
+        .alias('pts_per_gp'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_nurses)_.*$')))
+        .alias('pts_per_nurse'),
+        (pl.col('total_patients') / pl.sum_horizontal(pl.col('^(total_admin)_.*$')))
+        .alias('pts_per_admin'),
+    )
+
+    return df
+
+def calculate_patient_proportions(practices_raw):
+    df = practices_raw.with_columns(
+        (pl.col('total_male') / pl.col('total_patients')).alias('prop_male'),
+        (pl.col('total_female') / pl.col('total_patients')).alias('prop_female'),
+        (pl.sum_horizontal(pl.col('^.*_(0to4|5to14)$'))  / pl.col('total_patients'))
+        .alias('prop_0to14'),
+        (pl.sum_horizontal(pl.col('^.*_(15to44|45to64)$'))  / pl.col('total_patients'))
+        .alias('prop_15to64'),
+        (pl.sum_horizontal(pl.col('^.*_(65to74|75to84|85plus)$')) / pl.col('total_patients'))
+        .alias('prop_65plus')
+    )
+
+    return df
+
+def approximate_patient_summary_stats(practices_raw):
+    df = practices_raw.with_columns(
+        ((pl.sum_horizontal((pl.col('^.*_(0to4)$')) * 2) +
+        (pl.sum_horizontal(pl.col('^.*_(5to14)$')) * 9) +
+        (pl.sum_horizontal(pl.col('^.*_(15to44)$')) * 30) +
+        (pl.sum_horizontal(pl.col('^.*_(45to64)$')) * 55) +
+        (pl.sum_horizontal(pl.col('^.*_(65to74)$')) * 70) +
+        (pl.sum_horizontal(pl.col('^.*_(75to84)$')) * 80) +
+        (pl.sum_horizontal(pl.col('^.*_(85plus)$')) * 90)) /
+        pl.col('total_patients'))
+        .alias('approx_mean_age')
+    )
+
+    return df
+
+```
+
+```{python}
+
+df = (
+    practices_raw.lazy()
+    .pipe(scale_rural_urban_classes)
+    .pipe(sum_staff_totals)
+    .pipe(calculate_patients_per_staff)
+    .pipe(calculate_patient_proportions)
+    .pipe(approximate_patient_summary_stats)
+    .collect()
+)
+
+```
+
+## Boxplots
+
+```{python}
+
+cols = [
+    'imd_quartile',
+    # 'ruc',
+    'total_patients',
+    'total_staff',
+    'total_gps',
+    'total_nurses',
+    'prop_male',
+    'prop_female',
+    'prop_0to14',
+    'prop_15to64',
+    'prop_65plus',
+    'approx_mean_age',
+    # 'pts_per_gp',
+    # 'pts_per_nurse',
+    # 'pts_per_admin',
+    'pts_per_staff'
+]
+
+# specify columns and rows
+ncols = 3
+nrows = int(len(df[cols].columns)/ncols)
+
+# create figure and axes
+fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols*8,nrows*4))
+
+for i, col in enumerate(df[cols].columns):
+    ax = axes[i//ncols, i%ncols]
+    sns.boxplot(x=df[col], ax=ax)
+    ax.set_ylabel('')
+    ax.set_xlabel(col, fontsize=20)
+
+plt.suptitle('Numerical Feature Distributions', fontsize=30, y=1)
+plt.tight_layout()
+plt.show()
+
+```
+
+Quite a few of the features are heavily skewed, which will need to be addressed before clustering.
+
+### Correlations
+
+We can use a correlation matrix to get a bit of a sense of how the features are related to each other. This should help us identify features that are highly correlated and therefore redundant.
+```{python}
+
+cols = [
+    'imd_quartile',
+    'ruc',
+    'total_patients',
+    'total_staff',
+    'total_gps',
+    'total_nurses',
+    'prop_male',
+    'prop_female',
+    'prop_0to14',
+    'prop_15to64',
+    'prop_65plus',
+    'approx_mean_age',
+    'pts_per_gp',
+    'pts_per_nurse',
+    'pts_per_admin',
+    'pts_per_staff'
+]
+
+corr = df[cols].to_pandas().corr()
+
+fig, ax = plt.subplots(figsize=(15, 12))
+
+sns.heatmap(corr, fmt=".2f", annot=True, square=False, linewidths=.8, cmap="crest")
+
+plt.title('Numeric Feature Correlations\n', fontsize=25, y=1)
+
+plt.show()
+
+```
+
+There are pockets of features that are highly correlated with each other. For example (and wholly unsurprisingly), the staffing numbers are all highly correlated with each other. The patient proportions are also heavily correlated. The proportions of male/female patients are perfectly correlated, which is to be expected, but serves as a reminder that we don't need to include both in the model. The proportions of patients in each age group are also highly correlated with each other. The approximate mean age is almost perfectly correlated with the proportion of patients aged 65 and over. I didn't necessarily expect these two to be _as_ highly correlated as they are, but it makes sense that they are correlated, at least.
+
+I think, based on these results, there are several obvious candidates to drop from the model:
+
+- Total Patients & Total Staff
+- Proportion of Male Patients
+- Patient Age Proportions (or Approximate Mean Age)
+- Staffing Breakdowns (or Patients Per Staff)
+
+If we drop the approximate mean age feature, then we should only keep one of the patient age proportions (probably 65+). You could make an argument for keeping the 0-14 AND the 65+ proportions, but I don't think that's necessary.
+
+Finally, the staffing breakdowns are all highly correlated with the patients per staff feature, but not with each other. This means we either keep the feature capturing the total number of staff (per patient), OR the staffing breakdowns, but I think the total staff feature captures the same information ina more concise way.
+
+## Principal Component Analysis
+
+The correlations hint at a few features that are likely to form the basis of the underlying patterns in the data (deprivation, rural-urban classification, age distribution).
+
+We can use PCA to reduce the dimensionality of the data as part of the modelling process, because it will make the data less sparse and therefore easier to cluster. However, we can also use it here to visualise the data in two dimensions, which will help us get some sense of how the data is distributed in the feature space.
+
+```{python}
+
+cols = [
+    'imd_quartile',
+    'ruc',
+    'total_patients',
+    #'total_staff',
+    'total_gps',
+    'total_nurses',
+    # 'prop_male',
+    'prop_female',
+    # 'prop_0to14',
+    # 'prop_15to64',
+    # 'prop_65plus',
+    'approx_mean_age',
+    # 'pts_per_gp',
+    # 'pts_per_nurse',
+    # 'pts_per_admin',
+    'pts_per_staff'
+]
+
+```
+
+```{python}
+
+scaler = MinMaxScaler()
+
+X = df.select(cols)
+
+X = scaler.fit_transform(X)
+
+```
+
+```{python}
+
+pca = PCA(n_components=2)
+
+X_pca = pca.fit_transform(X)
+
+```
+
+```{python}
+
+pca.explained_variance_ratio_
+
+```
+
+```{python}
+
+sns.scatterplot(
+    x = X_pca[:, 0],
+    y = X_pca[:, 1],
+    hue=df.select('imd_quartile').to_pandas().values.ravel(),
+    s=100,
+    palette=colours,
+    alpha=0.7
+)
+
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+
+plt.title('Principal Component Analysis')
+
+plt.show()
+
+```
+
+```{python}
+
+sns.scatterplot(
+    x = X_pca[:, 0],
+    y = X_pca[:, 1],
+    hue=df.select('ruc').to_pandas().values.ravel(),
+    s=100,
+    palette=sns.color_palette(colours, as_cmap=True),
+    alpha=0.7
+)
+
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+
+plt.title('Principal Component Analysis')
+
+plt.show()
+
+```
+
+When you reduce the dimensionality of the data to just two components, we end up with deprivation and rural-urban classification as the two principal drivers of the patterns in the data.
