@@ -1,25 +1,28 @@
 import yaml
 
-from practice_similarities.example_modules.example_module import (
-    hello_world,
-    print_favourite_number,
-    print_string,
-)
+from practice_similarities.pipeline.import_data import import_data
 
+from practice_similarities.pipeline.transform_data import (
+    scale_rural_urban_classes,
+    sum_staff_totals,
+    calculate_patients_per_staff,
+    calculate_patient_proportions,
+    approximate_patient_summary_stats
+)
 
 def run_pipeline():
     """This is the main function that runs the pipeline"""
-    with open("src/practice_similarities/example_config.yml", "r") as file:
-        example_config = yaml.safe_load(file)
+    data = import_data("data/", "practices.arrow")
 
-    name = example_config["user_name"]
-    company = example_config["company"]
-    favourite_number = example_config["favourite_number"]
-
-    hello_string = hello_world(name, company)
-    print_string(hello_string)
-    print_favourite_number(favourite_number, name)
-
+    data = (
+        data.lazy()
+        .pipe(scale_rural_urban_classes)
+        .pipe(sum_staff_totals)
+        .pipe(calculate_patients_per_staff)
+        .pipe(calculate_patient_proportions)
+        .pipe(approximate_patient_summary_stats)
+        .collect()
+        )
 
 if __name__ == "__main__":
     run_pipeline()
